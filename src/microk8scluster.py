@@ -403,21 +403,31 @@ class MicroK8sCluster(Object):
         self.model.unit.status = MaintenanceStatus("joining the microk8s cluster")
         url = event.join_url
         logger.debug("Using join URL: {}".format(url))
-        try:
-            join_cmd = ["microk8s", "join", url]
-            if self.model.config.get("skip_verify"):
-                join_cmd += ["--skip-verify"]
 
-            subprocess.check_call(join_cmd)
-        except subprocess.CalledProcessError:
-            logger.error("Failed to join cluster; deferring to try again later.")
-            self.model.unit.status = BlockedStatus("join failed, will try again")
-            event.defer()
-            return
-        self._state.joined = True
-        event.join_complete = "true"
-        self.model.unit.status = ActiveStatus()
-        self.on.join_complete.emit(**self._event_args(event))
+        disable_cert_reissue = self.model.config["disable_cert_reissue"]
+        lockfile = Path(NO_CERT_REISSUE_LOCKFILE)
+        try:
+            if lockfile.exists():
+                lockfile.unlink(missing_ok=True)
+            try:
+                join_cmd = ["microk8s", "join", url]
+                if self.model.config.get("skip_verify"):
+                    join_cmd += ["--skip-verify"]
+
+                self._check_call(join_cmd)
+            except subprocess.CalledProcessError:
+                logger.error("Failed to join cluster; deferring to try again later.")
+                self.model.unit.status = BlockedStatus("join failed, will try again")
+                event.defer()
+                return
+
+            self._state.joined = True
+            event.join_complete = "true"
+            self.model.unit.status = ActiveStatus()
+            self.on.join_complete.emit(**self._event_args(event))
+        finally:
+            if disable_cert_reissue:
+                lockfile.touch()
 
     def _on_other_node_removed(self, event):
         departing_unit = self.framework.model.get_unit(event.departing_unit_name)
