@@ -160,6 +160,13 @@ class MicroK8sCluster(Object):
         self.framework.observe(self.on.other_node_removed, self._on_other_node_removed)
         self.framework.observe(self.on.this_node_removed, self._on_this_node_removed)
 
+    def _check_call(self, *cmd):
+        logger.debug(f'Running command {" ".join(*cmd)}')
+        output = subprocess.check_output(*cmd)
+        output = output.decode("utf-8")
+        logger.debug(f'Command output is: {output}')
+        return output
+
     def _event_args(self, relation_event):
         return dict(
             relation=relation_event.relation,
@@ -184,7 +191,7 @@ class MicroK8sCluster(Object):
 
         for package in packages:
             try:
-                subprocess.check_call(["/usr/bin/apt-get", "install", "--yes", package])
+                self._check_call(["/usr/bin/apt-get", "install", "--yes", package])
             except subprocess.CalledProcessError:
                 logger.exception("failed to install package %s, charm may misbehave", package)
 
@@ -195,13 +202,21 @@ class MicroK8sCluster(Object):
             cmd.append("--classic")
         if channel != "auto":
             cmd.append("--channel={}".format(channel))
-        subprocess.check_call(cmd)
+        self._check_call(cmd)
+        try:
+            self._check_call([
+                "microk8s", "status",
+                "--wait-ready", "--timeout=300"
+            ])
+        except subprocess.CalledProcessError:
+            logger.exception("timed out waiting for node to come up")
+
         group = "microk8s"
         if "strict" in channel:
             group = "snap_microk8s"
-        subprocess.check_call(["/usr/sbin/addgroup", "ubuntu", group])
+        self._check_call(["/usr/sbin/addgroup", "ubuntu", group])
         # Required for autocert, useful for the admin.
-        subprocess.check_call(["/usr/bin/snap", "alias", "microk8s.kubectl", "kubectl"])
+        self._check_call(["/usr/bin/snap", "alias", "microk8s.kubectl", "kubectl"])
         open_port("16443/tcp")
         self.model.unit.status = ActiveStatus()
 
@@ -258,7 +273,7 @@ class MicroK8sCluster(Object):
         # This file is only read on startup, so just truncate and append.
         with open(CONTAINERD_ENV_SNAP_PATH, "w") as env:
             env.write(configured)
-        subprocess.check_call(["systemctl", "restart", "snap.microk8s.daemon-containerd.service"])
+        self._check_call(["systemctl", "restart", "snap.microk8s.daemon-containerd.service"])
 
     def _custom_registries(self, event):
         configured = self.model.config["custom_registries"]
@@ -281,14 +296,14 @@ class MicroK8sCluster(Object):
 
         registries = update_tls_config(registries, old_registries)
         ContainerdConfig(registries).apply()
-        subprocess.check_call(["systemctl", "restart", "snap.microk8s.daemon-containerd.service"])
+        self._check_call(["systemctl", "restart", "snap.microk8s.daemon-containerd.service"])
         self._state.registries = configured
 
     def _refresh_channel(self, _):
         channel = self.model.config["channel"]
         if channel == "auto":
             return
-        infostr = subprocess.check_output("snap info microk8s".split())
+        infostr = self._check_call("snap info microk8s".split())
         info = yaml.safe_load(infostr)
         current = info.get("tracking")
         if not current or current == channel:
@@ -299,7 +314,7 @@ class MicroK8sCluster(Object):
             return
 
         self.model.unit.status = MaintenanceStatus("refreshing to {}".format(channel))
-        subprocess.check_call("snap refresh microk8s --channel={}".format(channel).split())
+        self._check_call("snap refresh microk8s --channel={}".format(channel).split())
         self.model.unit.status = ActiveStatus()
 
     def _coredns_config(self, event):
@@ -376,7 +391,9 @@ class MicroK8sCluster(Object):
 
     def _on_add_unit(self, event):
         self.model.unit.status = MaintenanceStatus("adding {} to the microk8s cluster".format(event.unit.name))
-        output = subprocess.check_output(["/snap/bin/microk8s", "add-node", "--token-ttl", "36000"]).decode("utf-8")
+        output = self._check_call(
+            ["/snap/bin/microk8s", "add-node", "--token-ttl", "36000"]
+        )
         url = join_url_from_add_node_output(output)
         logger.debug("Generated join URL: {}".format(url))
         event.join_url = url
@@ -431,13 +448,13 @@ class MicroK8sCluster(Object):
             "removing {} from the microk8s cluster".format(event.departing_unit_name)
         )
         logger.info("Removing {} (hostname {}) from the cluster.".format(event.departing_unit_name, hostname))
-        subprocess.check_call(["/snap/bin/microk8s", "remove-node", hostname])
+        self._check_call(["/snap/bin/microk8s", "remove-node", hostname])
         self.hostnames.forget(event.departing_unit_name)
         self.model.unit.status = ActiveStatus()
 
     def _on_this_node_removed(self, event):
         self.model.unit.status = MaintenanceStatus("leaving the microk8s cluster")
-        subprocess.check_call(["/snap/bin/microk8s", "leave"])
+        self._check_call(["/snap/bin/microk8s", "leave"])
         self.model.unit.status = ActiveStatus()
 
     def _update_etc_hosts(self, event):
@@ -470,8 +487,8 @@ class MicroK8sCluster(Object):
             event.defer()
             return
 
-        private_address = subprocess.check_output(["unit-get", "private-address"]).decode().strip()
-        public_address = subprocess.check_output(["unit-get", "public-address"]).decode().strip()
+        private_address = self._check_call(["unit-get", "private-address"]).strip()
+        public_address = self._check_call(["unit-get", "public-address"]).strip()
 
         csr_conf = self.model.config["csr_conf_template"]
         if not csr_conf:
@@ -487,7 +504,9 @@ class MicroK8sCluster(Object):
             fout.write(csr_conf)
 
         # re-run the configure script to update certificates
-        subprocess.check_call(["/usr/bin/snap", "set", "microk8s", "charm-update-certs={}".format(datetime.now())])
+        self._check_call([
+            "/usr/bin/snap", "set", "microk8s", "charm-update-certs={}".format(datetime.now())
+        ])
 
     def _manage_cert_reissue_lock(self, event):
         """Manage lock file to enable/disable cert reissue."""
@@ -498,18 +517,18 @@ class MicroK8sCluster(Object):
             Path(NO_CERT_REISSUE_LOCKFILE).unlink(missing_ok=True)
 
     def _microk8s_start(self, event):
-        subprocess.check_call(["/snap/bin/microk8s", "start"])
+        self._check_call(["/snap/bin/microk8s", "start"])
 
     def _microk8s_stop(self, event):
-        subprocess.check_call(["/snap/bin/microk8s", "stop"])
+        self._check_call(["/snap/bin/microk8s", "stop"])
 
     def _microk8s_status(self, event):
-        subprocess.check_call(["/snap/bin/microk8s", "status"])
+        self._check_call(["/snap/bin/microk8s", "status"])
 
     def _microk8s_kubeconfig(self, event):
-        kubeconfig = yaml.safe_load(subprocess.check_output(["/snap/bin/microk8s", "config"]))
+        kubeconfig = yaml.safe_load(self._check_call(["/snap/bin/microk8s", "config"]))
 
-        public_address = subprocess.check_output(["unit-get", "public-address"]).decode().strip()
+        public_address = self._check_call(["unit-get", "public-address"]).strip()
         try:
             if ipaddress.ip_address(public_address).version == 6:
                 public_address = "[{}]".format(public_address)
